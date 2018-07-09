@@ -20,14 +20,14 @@ The intended audience of this document is architects, developers and anyone who
 would like to get a better understanding of the details of the PoET 2.0 
 algorithm.
 
-This RFC describes a new PoET 2.0 Consensus for supporting the Intel® Software 
+This RFC describes a new PoET 2.0 Consensus for supporting the IntelÂ® Software 
 Guard Extensions(SGX) machines without Platform Services Enclave(PSE).
 
 # Motivation
 [motivation]: #motivation
 
 PoET 1.0 offers a very unique and efficient way to achieve consensus based on 
-secure timers set inside an Intel® Software Guard Extensions (SGX) enclave. The 
+secure timers set inside an IntelÂ® Software Guard Extensions (SGX) enclave. The 
 secure timer and the monotonic counters used in PoET 1.0 rely on 
 _SGX Platform Services_ to access these services from the system hardware. 
 _SGX Platform Services_, unfortunately, are not yet available on all SGX 
@@ -40,108 +40,511 @@ by making the PoET algorithm independent of the _SGX Platform Services_.
 The following terms are used throughout the PoET spec and are defined here for 
 reference.
 
-*Enclave*
-
-A protected area in an application’s address space which provides 
-confidentiality and integrity even in the presence of privileged malware.
-
-The term can also be used to refer to a specific enclave that has been 
-initialized with a specific code and data.
-
-*EPID*
-
-An anonymous credential system. 
-
-*EPID Pseudonym*
-
-Pseudonym of an SGX platform used in linkable quotes. 
-It is part of the IAS attestation response according to IAS API 
-specifications. It is computed as a function of the service Basename 
-(validator network in our case) and the device’s EPID private key.
-
-*PPK, PSK*
-
-PoET ECC public and private key created by the PoET enclave.
-
-*IAS Report Key*
-
-IAS public key used to sign attestation reports as specified in the current 
-IAS API Guide.
+| Term             | Definition |
+| ---------------- | ------------------------------------------- |
+|Enclave           | A protected area in an application’s address space which provides confidentiality and integrity even in the presence of privileged malware. The term can also be used to refer to a specific enclave that has been initialized with a specific code and data.|
+|Basename          | A service provider base name. In our context the service provider entity is the distributed ledger network. Each distinct network should have its own Basename and Service Provider ID (see EPID and IAS specifications).|
+|EPID              | An anonymous credential system. See E. Brickell and Jiangtao Li: “Enhanced Privacy ID from Bilinear Pairing for Hardware Authentication and Attestation”. IEEE International Conference on Social Computing / IEEE International Conference on Privacy, Security, Risk and Trust. 2010.|
+|EPID Pseudonym    | Pseudonym of an SGX platform used in linkable quotes.  It is part of the IAS attestation response according to IAS API specifications. It is computed as a function of the service Basename (validator network in our case) and the device's EPID private key.|
+|PPK, PSK          | PoET ECC public and private key created by the PoET enclave.|
+|IAS Report Key    | IAS public key used to sign attestation reports as specified in the current IAS API Guide.|
+|PSEmanifest       | Platform Services Enclave manifest. It is part of an SGX quote for enclaves using Platform Services like Trusted Time and Monotonic Counters.|
+|AEP               | Attestation evidence payload sent to IAS (see IAS API specifications). Contains JSON encodings of the quote and an optional nonce.|
+|AVR               | Attestation Verification Report, the response to a quote attestation request from the IAS. It is verified with the IAS Report Key. It contains a copy of the input AEP.|
+|`WaitCertId_{n}`  | The `n`-th or most recent WaitCertificate digest. We assume `n >= 0` represents the current number of blocks in the ledger. WaitCertId is a function of the contents of the Wait Certificate. For instance the SHA256 digest of the WaitCertificate ECDSA signature.|
+|OPK, OSK          | Originator ECDSA public and private key. These are the higher level ECDSA keys a validator uses to sign messages.|
+|OPKhash           | SHA256 digest of OPK|
+|blockDigest       | ECDSA signature with OSK of SHA256 digest of transaction block that the validator wants to commit.|
+|localMean         | Estimated wait time local mean.|
+|PoET\_MRENCLAVE   | Public MRENCLAVE (see SGX SDK documentation) value of valid PoET SGX enclave.|
+|`K`               | Number of blocks a validator can commit before having to sign-up with a fresh PPK.|
+|`c`               | The "sign-up delay", i.e., number of blocks a validator has to wait after sign-up before starting to participate in elections.|
+|MinDuration       | Minimum duration for a WaitTimer.|
+|Wall Clock        | The number of seconds elapsed since a synchronization event, typically the first block arriving after a validator registers|
+|Chain Clock       | The cumulative wait times of all the blocks in the chain. Each fork has its own chain clock |
+|Duration          | A 256 bit random number generated by the enclave and recorded in the WaitCertificate. The Duration influences the Wait Time of a block |
+|BlockNumber       | A number indicative of the position of a block in the chain. It is also be known as the 'Block Depth'|
+|Proposed Block    | A block that is currently under construction and for whom a WaitCertificate has not yet been generated|
+|Claim Block       | A block whose construction is complete and for whom a WaitCertificate has been generated. A Claim Block announces a validator's candidature for the PoET Leader Election|
 
 # Guide-level explanation
 [guide-level-explanation]: #guide-level-explanation
 
-In PoET 1.0, the PoET SGX enclave set a timer internally and would only release a WaitCertificate, once the timer elapsed. To be considered a candidate for consensus, a block (a.k.a Claim Block) would have to be accompanied by the corresponding WaitCertificate. This meant that peers receiving a Claim Block accompanied by the WaitCertificate, were assured that the block had not been forwarded prematurely, hence the phrase ‘Proof of Elapsed Time’.
-PoET 2.0, however, removes the reliance on internal timers and monotonic counters within SGX. This necessitates a different approach for enforcing wait times. Rather than set a timer inside SGX, PoET 2.0 relies on SGX to provide it with a duration to wait and sets the timer OUTSIDE SGX. A Claim Block is forwarded only after the timer has expired. The block is now accompanied by a WaitCertificate from SGX containing the duration that the block was expected to wait for.
-While this opens up the possibility of misuse by a malicious actor, the community of validators is engaged to enforce the wait on the block. Blocks arriving at peers earlier than suggested by their WaitCertificate are held back until the time is right to forward them. The larger the size of the network, the more resistant the protocol is to attack by a malicious actor or a cabal.
+The Proof of Elapsed Time (PoET) Consensus method offers a solution to the
+Byzantine Generals Problem that utilizes a “trusted execution environment” to
+improve on the efficiency of present solutions such as Proof-of-Work. This
+specification defines a concrete implementation for SGX. The following
+presentation assumes the use of Intel SGX as the trusted execution environment. 
+
+At a high-level, PoET stochastically elects individual peers to execute requests
+at a given target rate. Individual peers sample an exponentially distributed
+random variable and wait for an amount of time dictated by the sample. The peer
+with the smallest sample wins the election. Cheating is prevented through the
+use of a trusted execution environment, identity verification and blacklisting
+based on asymmetric key cryptography, and an additional set of election
+policies.
+
+For the purpose of achieving distributed consensus efficiently,
+a good lottery function has several characteristics:
+
++ Fairness: The function should distribute leader election across the broadest 
+possible population of participants.
+
++ Investment: The cost of controlling the leader election process should be 
+proportional to the value gained from it.
+
++ Verification: It should be relatively simple for all participants to verify 
+that the leader was legitimately selected.
+
+PoET is designed to achieve these goals using new secure CPU instructions
+which are becoming widely available in consumer and enterprise processors.
+PoET uses these features to ensure the safety and randomness of the leader
+election process without requiring the costly investment of power and
+specialized hardware inherent in most “proof” algorithms.
+
+Sawtooth includes an implementation which simulates the secure instructions.
+This should make it easier for the community to work with the software but
+also forgoes Byzantine fault tolerance.
+
+PoET 2.0 essentially works as follows:
+
++ Each validator requests a wait certificate corresponding to each block it
+        wishes to publish, from an enclave (a trusted function)
+
++ The wait certificate contains a duration - a 256 bit random
+	number, as well as a related wait time
+
++ Every validator maintains two clocks, a WallClock (`WC`) - the
+	time elapsed since an initial synchronization event and a ChainClock
+        (`CC`) - a cumulative count of the wait times for all blocks in the
+        chain since the synchronization event
+	   
++ On the originating validator, the WaitTime is used to throttle broadcast of
+	claim blocks. Upon creating the WaitCertificate, the validator waits
+	until WaitTime seconds have elapsed, to broadcast the block over the
+        gossip network
+	
++ On peer validators, a block is eligible for consensus if the CC for its fork
+        does not exceed the validator's WC. If it does (e.g. for an
+        early-arriving block), the block is held back by `CC-WC` seconds until
+        it becomes eligible for consensus and broadcast over the gossip network
+  
++ The validator with the smallest duration for a particular 
+	transaction block is elected the leader
+
++ One function, such as “CreateWaitCertificate”, creates the
+	WaitCertificate for a transaction block that is guaranteed to
+	have been created by the enclave
+
++ Another function, such as “CheckWaitCertificate”, verifies
+	that the Certificate was created by the enclave
+
+The PoET leader election algorithm meets the criteria for a good lottery
+algorithm. It randomly distributes leadership election across the entire
+population of validators with distribution that is similar to what is
+provided by other lottery algorithms. The probability of election
+is proportional to the resources contributed (in this case, resources
+are general purpose processors with a trusted execution environment).
+An attestation of execution provides information for verifying that the
+certificate was created within the enclave (and that the validator waited
+the allotted time). Further, the low cost of participation increases the
+likelihood that the population of validators will be large, increasing
+the robustness of the consensus algorithm.
+
+In PoET 1.0, the PoET SGX enclave set a timer internally and would only release
+a WaitCertificate, once the timer elapsed. To be considered a candidate for 
+consensus, a block (a.k.a Claim Block) would have to be accompanied by the 
+corresponding WaitCertificate. This meant that peers receiving a Claim Block 
+accompanied by the WaitCertificate, were assured that the block had not been 
+forwarded prematurely, hence the phrase "Proof of Elapsed Time".
+PoET 2.0, however, removes the reliance on internal timers and monotonic 
+counters within SGX. This necessitates a different approach for enforcing wait 
+times. Rather than set a timer inside SGX, PoET 2.0 relies on SGX to provide it 
+with a duration to wait and sets the timer OUTSIDE SGX. A Claim Block is 
+forwarded only after the timer has expired. The block is now accompanied by a 
+WaitCertificate from SGX containing the duration that the block was expected to
+wait for.
+
+While this opens up the possibility of misuse by a malicious actor, the 
+community of validators is engaged to enforce the wait on the block. Blocks 
+arriving at peers earlier than suggested by their WaitCertificate are held back
+until the time is right to become eligible for consensus. The larger the size of
+the network, the more resistant the protocol is to attack by a malicious actor 
+or a cabal.
 
 # Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
 
-Here we describe the PoET 2.0 algorithm in greater detail.
+Here we describe the PoET 2.0 algorithm in greater detail. We will also call out
+sections that are unchanged from PoET 1.0.
 
-## Initialization
-When the PoET 2.0 module is initialized, it performs the following actions:
-1. Generate an ECDSA key pair. This pair is held in SGX memory and NEVER committed to disk for reuse subsequently
-2. Create a table in SGX memory to map the Block Number to WaitCertificates. Also store the block number of the chain head in SGX
-3. Generate a Quote containing the PPK and perform Quote verification with the IAS
-4. Check if there was a previous PPK registration. If there was, verify if ‘K’ blocks have been added to the chain since the key’s registration. If K blocks have not passed, wait until K blocks have been added. If the process restarts, signup at process startup and resume the K-test since this new signup
-5. Register the PPK and the IAS response with the ledger
-6. Wait for ‘C’ blocks to be added to the chain before participating in consensus(C-test)
+## PoET enclave Data Structures
+The PoET enclave uses the following data structures:
 
-## Wall Clock and Chain Clock
-The PoET 2.0 algorithm maintains two clocks, the _Wall Clock_ and the _Chain Clock_.
-The Wall Clock (WC) measures the time elapsed since the arrival of the ‘Sync Block’, i.e. the first block on the chain.
-The Chain Clock (CC) measures the cumulative wait duration of all the blocks in the chain (each fork will have its own CC).
-Upon receiving the Sync Block, WC and CC are initialized to 0. In practice, the WC may be calculated by recording the system time at the moment of the arrival of the Sync Block and subsequently subtracting this timestamp from the current time.
-To handle clock drifts, it may become necessary to synchronize with a standard network clock. Details are out of scope for this version of the document.
+### WaitCertificate
+```
+WaitCertificate {
+    byte[32] Duration    # A random 256 bit number generated by SGX
+    double WaitTime      # The number of seconds to wait, as a function of the
+                         # Duration and the LocalMean
+    double LocalMean     # The computed local mean
+    byte[32] BlockID     # The BlockID passed in to the Enclave
+    byte[32] PrevBlockID # The BlockID of the previous block, as stored in the
+                         # previousWaitCertificate
+    uint32 BlockNumber   # The length of the chain
+    byte[32] TxnHash     # The hash of the transactions in the block
+    byte[] ValidatorID   # The ID of the current Validator
+    byte[64] Sign        # The signature of WaitCertificate computed over all
+                         # the fields using the PSK 
+  }
+```
+### Global state
+```
+uint32 LastBlockNumber              # The last blocknumber that the enclave has
+                                    # generated
+map<BlockNumber, WaitCertificate>   # Contains each wait certificate generated 
+                                    # by the enclave. Only one waitCertificate 
+                                    # will be allowed per block position across 
+                                    # all forks
+```
+## PoET enclave functions
+It exports the following functions:
 
-## Block Creation
-Once the algorithm is in a state to publish blocks (i.e. the C-test passes), it starts the process of creating Claim Blocks with the aim of participating in the Consensus mechanism.
-The Claim/Candidate Block is assembled as usual with no special processing required for PoET 2.0
+### generateSignUpData(OPKhash)
 
-## Wait Certificate Creation
-Once a Claim Block is created, the PoET algorithm requests the PoET enclave to create the WaitCertificate.
+**Returns**
 
-The contents of the WaitCertificate for PoET 2.0 are:
+```
+    byte[64]  PPK
+    byte[432] report # SGX Report Data Structure
+```    
+**Parameters**
 
-* Duration: A random 256 bit number generated by SGX
-* WaitTime: The number of seconds to wait, determined by the LocalMean
-* BlockID: The BlockID passed in to the Enclave
-* PrevBlockID: The BlockID of the previous block, as stored in the previousWaitCertificate
-* TxnHash: The hash of the transactions in the block
-* BlockNumber: The length of the chain
-* ValidatorID: The ID of the current Validator
-* Sign: The signature of the WaitCertificate computed over all the fields using the PSK 
+```
+    byte[32] OPKhash # SHA256 digest of OPK
+```
+**Description**
 
-Once the WaitCertificate is created, the enclave stores the Last Block # and the WaitCertificate in the table created previously. The validator will only create a single wait certificate per block. This implies that if a fork containing fewer blocks becomes active, the validator will NOT be able to publish any more blocks until the new fork has added enough blocks to catch up to the previous chain.
+1. Generate fresh ECC key pair (PPK, PSK)
+2. Create SGX enclave report, store ``SHA256(OPKhash|PPK)`` in 
+``report_data`` field.
+3. Return (PPK, report).
 
-## Block Publishing
-With the Claim Block ready and the WaitCertificate created, the validator will determine the duration for which to set the timer. The duration of the wait is determined by the ‘Duration’ field in the WaitCertificate.
-Ideally, any selected algorithm should be capable of converting the duration to a wait time distributed uniformly between 0 and LocalMean seconds.
+### createWaitCertificate(PreviousWaitCert, BlockDigest, ValidatorID)
 
-## Block Verification
-Upon receiving a Claim Block and a WaitCertificate, the receiving validator does the following:
-### Sanity checks
-1.	Ensure the Block and WaitCertificate signatures are valid
-2.	The Block’s ID matches the WaitCertificate’s blockID
-3.	If the block extends the current chain head, proceed to the Block Validity check. If it is a ‘future’ block, cache it for processing later.
-4.	If the block claims a previous block as the parent, proceed to ‘Fork Resolution’
-### Validity check & block publishing
-5.	Compute the new CC. The block is valid if CC + E < WC. Here E is a network latency coefficient added to simulate the average network delay seen by the validator.
-6.	Send the block to the validator for processing the transactions
-7.	If valid, commit the block, store the blockID and WaitCertificate in SGX
-8.	Forward the block to the gossip network
-9.	Drop the existing block proposal and restart from the new chain head.
-### Early Arriving blocks
-10.	If the block is an early-arriving block, compare the duration with the duration of the Claim Block. If the block duration is smaller, drop the Claim Block. Wait for the WC to catch up with the CC. If the Claim Block duration is less than the incoming block duration, discard the incoming block.
-11.	Proceed to step 6 once the block becomes valid.
-### Fork Resolution
-12.	If the new block claims an earlier block as a parent, check for any cached blocks claiming the new block as a parent, retrieve them. Compute the new CC and check if the chain is valid (CC + E < WC)
-13.	If valid, compare existing chain length with the new chain length. If existing chain length is more, discard new chain. If the new chain is longer, switch to the new chain (commit the new blocks)
-14.	If the two chains are equal, compare Chain Clocks. Select the chain with the smaller CC.
-15.	If the chain is switched, drop the block proposal & restart (Step 9).
-16.	Forward the new block over the gossip network.
+**Returns**
+
+```
+    WaitCertificate waitCertificate
+    byte[64] signature # ECDSA PSK signature of waitCertificate
+```
+**Parameters**
+
+```
+    WaitCertificate PreviousWaitCert #The wait certificate of the current chain 
+                                     #head
+    byte[] blockDigest # ECDSA signature with originator private key of SHA256
+                       # digest of transaction block that the validator wants
+                       # to commit
+    byte[] ValidatorID
+```
+**Description**
+
+1. `if(PreviousWaitCert.BlockNumber < LastBlockNumber) then throw
+    StaleRequestException()`
+2. Generate 256 bit random `Duration`.
+3. Convert lowest 64-bits of `Duration` into double precision number 
+	in `[0, 1]` represented by `duration'`
+4. Compute `WaitTime = minimumDuration - localMean * log(duration')`.
+5. Create WaitCertificate object `waitCertificate =
+   WaitCertificate(WaitTimer, Duration, blockDigest)`
+6. Compute ECDSA signature of waitCertificate using PSK: `signature =
+   ECDSA_{PSK} (waitCertificate)`
+7. Return `(waitCertificate, signature)`
+    
+### checkWaitCertificate(WaitCertificate)
+**Returns**
+
+```
+    boolean isValid # The WaitCertificate passed all validity checks in Enclave
+```
+**Parameters**
+
+```
+    WaitCertificate waitCertificate
+    byte[64] signature
+    byte[]   block
+    byte[32] OPK
+    byte[32] PPK
+```
+## Initialization and Sign-up
+
+A participant joins as a validator by downloading the PoET SGX enclave and a
+SPID certificate for the blockchain. The client side of the validator runs
+the following sign-up procedure:
+
+1. Start PoET SGX enclave: ENC.
+2. Generate sign-up data: `(PPK, report) =
+   {ENC.generateSignUpData(OPKhash)}` The ``report_data`` (512 bits)
+   field in the report body includes the SHA256 digest of (OPKhash | PPK).
+3. Ask SGX Quoting Enclave (QE) for linkable quote on the report (using the
+   validator network's Basename).
+4. If Self Attestation is enabled in IAS API: request attestation of linkable
+   quote to IAS. The AEP sent to IAS must contain:
+
+   * isvEnclaveQuote: base64 encoded quote
+   * nonce: :math:`WaitCertId_{n}`
+
+   The IAS sends back a signed AVR containing a copy of the input AEP and the
+   EPID Pseudonym.
+
+5. If Self Attestation is enabled in IAS API: broadcast self-attested join
+   request, (OPK, PPK, AEP, AVR) to known participants.
+
+6. If Self Attestation is NOT enabled in IAS API: broadcast join request, (OPK,
+   PPK, quote) to known participants.
+
+A validator has to wait for `c` blocks to be published on the distributed
+ledger before participating in an election.
+
+>Note: 
+>An important difference between PoET 1.0 and PoET 2.0 is that PoET 2.0 does
+>not store the signup data in a sealed blob. The implication of this change
+>is that the enclave has to sign up each time it gets loaded. Part of the
+>reason for doing away with the sealed blob creation is the unavailability of
+>the Monotonic counter (MTC) which provides certain security guarantees for
+>sealed data stored to disk.
+     
+The server side of the validator runs the following sign-up procedure:
+1. Wait for a join request.
+2. Upon arrival of a join request do the verification:
+
+   If the join request is self attested (Self Attestation is enabled in IAS
+   API): (OPK, PPK, AEP, AVR)
+	* Verify AVR legitimacy using IAS Report Key and therefore quote
+          legitimacy.
+	* Verify the ``report_data`` field within the quote contains the SHA256
+          digest of (OPKhash | PPK).
+	* Verify the nonce in the AVR is equal to `WaitCertId_{n}`, namely the
+          digest of the most recently committed block. It may be that the sender
+          has not seen `WaitCertId_{n}` yet and could be sending
+          `WaitCertId_{n'}` where `n'<n`.
+          In this case the sender should be urged to updated his/her
+          view of the ledger by appending the new blocks and retry. It could
+          also happen that the receiving validator has not seen
+          `WaitCertId_{n}` in which case he/she should try to update his/her
+          view of the ledger and verify again.
+	* Verify MRENCLAVE value within quote is equal to PoET\_MRENCLAVE (there
+      could be more than one allowed value).
+	* Verify basename in the quote is equal to distributed ledger Basename.
+	* Verify attributes field in the quote has the allowed value (normally
+          the enclave must be in initialized state and not be a debug enclave).
+ 
+   If the join request is not self attested (Self Attestation is NOT enabled in
+   IAS API): (OPK, PPK, quote)
+
+   * Create AEP with quote:
+
+      * isvEnclaveQuote: base64 encoded quote
+
+ 3. Send AEP to IAS. The IAS sends back a signed AVR.
+ 4. Verify received AVR attests to validity of both quote and
+    save EPID Pseudonym.
+ 5. Verify ``report_data`` field within the quote contains the SHA256 digest of
+	(OPKhash | PPK).
+ 6. Verify MRENCLAVE value within quote is equal to PoET\_MRENCLAVE (there could
+	be more than one allowed value).
+ 7. Verify basename in the quote is equal to distributed ledger Basename.
+ 8. Verify attributes field in the quote has the allowed value (normally the
+    enclave must be in initialized state and not be a debug enclave).
+   
+   If the verification fails, exit.
+
+   If the verification succeeds but the SGX platform identified by the EPID
+   Pseudonym in the quote has already signed up, ignore the join request, exit.
+
+   If the verification succeeds:
+
+   * Pass sign-up certificate of new participant (OPK, EPID Pseudonym, PPK,
+     current :math:`WaitCertId_{n}` to upper layers for registration in
+     EndPoint registry.
+   * Goto 1
+     
+# Leader Election
+### Wall Clock and Chain Clock
+The PoET 2.0 algorithm maintains two clocks, the _Wall Clock_ and the
+_Chain Clock_.
+
+The Wall Clock (`WC`) measures the time elapsed since the arrival of the
+'Sync Block', typically the first block on the chain. It is maintained by the
+validator on the 'untrusted' portion of the PoET code. The Chain Clock (`CC`)
+measures the cumulative `WaitTime` of all the blocks in the chain (each
+fork will have its own `CC`).
+
+Upon receiving the Sync Block, `WC` and `CC` are initialized to 0. 
+
+>Note 1: In practice, the WC may be calculated by recording the system time at 
+>the moment of the arrival of the Sync Block and subsequently subtracting this 
+>timestamp from the current time.
+
+>Note 2: Notice that the CC is a function of the WaitTime, which is computed within
+>the enclave.
+
+### Block Publishing
+
+To publish a block in the election phase a validator runs the following procedure 
+on the client side:
+
+1. Start the PoET SGX enclave: ENC
+2. Call `(waitCertificate, signature) = ENC.createWaitCertificate(blockDigest)`
+3. Wait `WaitCertificate.WaitTime` seconds
+4. Broadcast `(waitCertificate, signature, block, OPK, PPK)` over the
+   Gossip Network.
+
+   Here `block` is the transaction block identified by `blockDigest`.
+
+>Once a WaitCertificate is created, the enclave stores the BlockNumber and 
+>WaitCertificate in a table. The enclave will only allow one WaitCertificate per
+>BlockNumber and will not allow a WaitCertificate to be created for a block
+>earlier than the last BlockNumber that it created a WaitCertificate for. This
+>prevents an attacker from 'going back in time' to create a block and
+>waitCertificate.
+
+### Block Verification
+Upon receiving a Block from a peer over the Gossip Network, a server side
+validator first the block for eligibility before it can be allowed to
+participate in consensus.
+
+#### Block Eligibility Checks
+1. Verify the PPK and OPK belong to a registered validator by checking the
+   EndPoint registry.
+
+2. Verify the signature is valid using sender's PPK.
+
+3. Verify the PPK was used by sender to commit less than `K` blocks by checking 
+   EndPoint registry (otherwise sender needs to re-sign).
+
+4. Verify the waitCertificate.waitTimer.localMean is correct by comparing
+   against localMean computed locally.
+
+5. Verify the waitCertificate.blockDigest is a valid ECDSA signature of the
+   SHA256 hash of block using OPK.
+
+6. Verify the sender has been winning elections according to the expected
+   distribution (see z-test documentation).
+
+7. Verify the sender signed up at least :math:`c` committed blocks ago, i.e.,
+   respected the `c` block start-up delay.
+
+8. Verify that the block is not an early-arriving block by computing 
+`CC' = CC + waitCertificate.WaitTime`, then `WC >= CC'`, where `CC` is the 
+existing Chain Clock of the fork being extended by the new block.
+
+>Implementation Note1: While checking for early arriving blocks, implementations
+>may choose to add a constant `E`, representing average delay in seconds due to 
+>network latency. The check will then be `WC >= CC' + E`
+
+>Implementation Note2: There may be cases where a block arrives earlier than 
+>its predecessors. In such cases, the block will need to be cached until its
+>predecessors arrive before it can be checked for Eligibility.
+
+A block passing all checks is considered 'Eligible' and proceeds to participate
+in consensus. It is also further broadcast over the Gossip network to
+neighboring peers.
+
+An early arriving block (where `WC < CC'`) is considered 'Ineligible'. The block
+is cached for `CC' - WC` seconds until it becomes 'Eligible'. It is then
+broadcast to neighboring peers over the Gossip Network.
+
+>In the absence of an enclave enforced block publishing delay as in PoET 1.0,
+>the Wall Clock (`WC`) acts as a community enforced block publishing delay.
+>Validators will only forward blocks when they can independently verify that
+>sufficient time has elapsed. 
+
+>Similar to PoET 1.0, the primary aim of this mechanism is to improve efficiency
+>of leader election. It aims at having a single claim outsanding at any given
+>time in the network.
+
+### Block Commit and Fork Resolution
+Once it is determined that an incoming block is Eligible, the validator performs
+the following steps:
+
+1. If the new block extends the current chain head:
+   * If the validator is still working on a Proposed Block (i.e. no Claim
+     Block has been created), accept the new block as the Chain Head, drop
+     the current proposed block. Commit the block.
+   * If the validator has published a Claim Block, compare the 
+     `WaitCertificate.Duration` of both blocks. The block having the lower
+     Duration is the winner. If the new block wins, commit the block and
+     update the Chain Head.
+   * Check the Block Cache for any blocks that may claim the new Chain Head
+     as a parent (i.e. blocks that may have arrived out of order). Start
+     the Block Eligibility checks.
+	
+2. If the new block claims an earlier block as a parent, walk the chain back 
+   until a common parent is reached. This may involve pulling previously
+   discarded blocks out of the block cache. Check the chain length of each
+   fork.
+   * If the existing (active) fork is longer, discard the new block
+   (implementations may choose to cache blocks for some time)
+   * If the new fork is longer, switch to the new fork.
+   * If the two forks are of equal length
+     * compare the Chain Clock(`CC`) of each fork. The lower `CC` wins.
+       * If the Chain Clocks are equal, compare the
+         `WaitCertificate.Duration` of the topmost blocks in the forks.
+          The lower Duration wins.
+
+3. If the Chain Head has been updated, discard any existing Proposed Block and
+   start building a new Proposed Block.
+
+## Bootstrapping new validator nodes
+
+When a new validator joins the network, it synchronizes its ledger and state
+with its neighbors. It then performs the following steps to bootstrap its 
+Wall Clock:
+
+1. Compute the Chain Clock(`CC`) for the current valid chain
+2. Set `WC = CC`
+3. For each block arriving during the `C` block delay that extends the chain
+   head, compute:
+
+   `CC' = CC + WaitCertificate.WaitTime`
+4. Calculate `offset = CC' - WC` (this may be a negative number). Also calculate
+an `AverageOffset` value that maintains a running average of all the clock
+offsets observed during the `C` block delay.
+5. At the end of the `C` block delay, calculate the final `WC = WC +
+   AverageOffset`
+
+This mechanism should bootstrap the Wall Clock to a reasonable value and allow
+the validator to effectively participate in consensus. 
+
+## Clock Drifts and Network Latency
+
+PoET 2.0 relies on the system clock in two instances: for setting a timer to
+wait for WaitTime seconds and for maintaining the Wall Clock.
+
+Clock drifts on a validator may cause it to broadcast a block earlier or later
+than intended. On the peer, clock drifts will impact the Wall Clock, thereby
+impacting block eligibility. Depending on the drift, blocks may become eligible
+earlier or later than ideal.
+
+For forward clock drifts, the primary impact on the network will be of decreased
+efficiency of block publication, by potentially having multiple Claim Blocks
+active at any given time. Negative clock drifts may mean that potential SLAs for
+target block publishing intervals may not be met in some cases.
+
+The Leader Election mechanism itself is independent of the clock and will not be
+impacted by drifts.
+
+As such, the the clocks need only be reasonably accurate. Existing system clock
+synchronization mechanisms like NNTP etc. may suffice to keep the network
+operating at the desired level of efficiency.
+
+Network latencies may be exploited by malicious nodes to broadcast blocks
+earlier than required. Again, this behavior doesn't impact leader election. The
+community of validators may choose to take observed network latencies into
+account while determining block eligibility, thereby regulating the frequency of
+blocks published by malicious or compromised nodes.
 
 # Drawbacks
 [drawbacks]: #drawbacks
@@ -149,12 +552,15 @@ Upon receiving a Claim Block and a WaitCertificate, the receiving validator does
 # Rationale and alternatives
 [alternatives]: #alternatives
 
-Poet 2.0 improves on PoET 1.0 adding support for SGX devices without PSE. Current PoET 1.0 limits the availability of PoET consensus only to SGX devices with PSE.
+Poet 2.0 improves on PoET 1.0 adding support for SGX devices without PSE. 
+Current PoET 1.0 limits the availability of PoET consensus only to SGX devices 
+with PSE.
 
 # Prior art
 [prior-art]: #prior-art
 
-PoET 2.0 is based on mostly PoET 1.0 and newer solutions for overcoming challenges thereof. 
+PoET 2.0 is based on mostly PoET 1.0 and newer solutions for overcoming 
+challenges thereof. 
 
 # Unresolved questions
 [unresolved]: #unresolved-questions
